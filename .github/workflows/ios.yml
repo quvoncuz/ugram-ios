@@ -1,0 +1,85 @@
+name: iPhone preview
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-preview
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Public standard runners are free. Never silently spend private-repo quota.
+    if: github.event.repository.private == false
+    runs-on: xcode-27
+    timeout-minutes: 330
+    steps:
+      - name: Checkout Ugram build tools
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Check Telegram API configuration
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: python3 scripts/prepare.py --check-credentials
+
+      - name: Read pinned source version
+        id: upstream
+        run: |
+          python3 - <<'PY'
+          import json, os
+          config = json.load(open('upstream.json'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('ref=' + config['ref'] + '\n')
+          PY
+
+      - name: Checkout Telegram iOS source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: TelegramMessenger/Telegram-iOS
+          ref: ${{ steps.upstream.outputs.ref }}
+          path: .build/Telegram-iOS
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Select the required Xcode
+        run: |
+          XCODE_REQUIRED=$(python3 -c 'import json; print(json.load(open("upstream.json"))["xcode"])')
+          test -d "/Applications/Xcode_${XCODE_REQUIRED}.app/Contents/Developer"
+          sudo xcode-select --switch "/Applications/Xcode_${XCODE_REQUIRED}.app/Contents/Developer"
+          xcodebuild -version
+          df -h .
+
+      - name: Prepare Ugram preview
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          python3 scripts/prepare.py .build/Telegram-iOS
+          swift scripts/icon.swift .build/Telegram-iOS/Telegram/UgramAssets.xcassets/AppIcon.appiconset
+
+      - name: Build arm64 IPA
+        run: bash scripts/build.sh .build/Telegram-iOS
+
+      - name: Upload preview for local signing
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: Ugram-iOS-preview
+          path: |
+            out/Ugram-preview.ipa
+            out/SHA256SUMS
+            out/build-info.json
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Remove generated API configuration
+        if: always()
+        run: |
+          rm -f .build/Telegram-iOS/build-system/ugram-configuration.json
+          rm -f .build/Telegram-iOS/build-input/configuration-repository/variables.bzl
