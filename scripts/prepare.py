@@ -29,6 +29,23 @@ def replace_exact(text, old, new, count=1):
     return text.replace(old, new)
 
 
+def unsigned_application_rule(text):
+    # The pinned rules_apple skips codesign with disable_legacy_signing, but its
+    # application rule still unconditionally requires an embedded profile.
+    # Restrict this adjustment to ios_application and the unsigned feature.
+    start = text.index('def _ios_application_impl(ctx):')
+    end = text.index('\ndef ', start + 1)
+    application = replace_exact(text[start:end],
+        '    if platform_prerequisites.platform.is_device:\n'
+        '        processor_partials.append(\n'
+        '            partials.provisioning_profile_partial(',
+        '    if (platform_prerequisites.platform.is_device and\n'
+        '        "disable_legacy_signing" not in features):\n'
+        '        processor_partials.append(\n'
+        '            partials.provisioning_profile_partial(')
+    return text[:start] + application + text[end:]
+
+
 def prepare(source):
     api_id, api_hash = credentials()
     pin = json.loads((ROOT / 'upstream.json').read_text())
@@ -67,8 +84,11 @@ def prepare(source):
     bazelrc = bazelrc_path.read_text()
     if '# Ugram:' in bazelrc:
         raise SystemExit('Source is already prepared; use a fresh checkout for each build.')
+    ios_rules_path = source / 'build-system/bazel-rules/rules_apple/apple/internal/ios_rules.bzl'
+    ios_rules = unsigned_application_rule(ios_rules_path.read_text())
     build_path.write_text(build)
     bazelrc_path.write_text(bazelrc + flags)
+    ios_rules_path.write_text(ios_rules)
     config_path = source / 'build-system/ugram-configuration.json'
     config_path.write_text(json.dumps(config, indent=2) + '\n')
     config_path.chmod(0o600)
