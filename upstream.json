@@ -1,0 +1,9 @@
+{
+  "repository": "TelegramMessenger/Telegram-iOS",
+  "ref": "24638bc69bd083981b178dd1e7f921eebbf7fc46",
+  "tag": "release-13.2",
+  "xcode": "27.1",
+  "bundle_id": "uz.ugram.ios",
+  "display_name": "Ugram Preview",
+  "status": "bootstrap; Android Ugram features are not ported yet"
+}

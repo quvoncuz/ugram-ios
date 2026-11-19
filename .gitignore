@@ -1,0 +1,14 @@
+.build/
+out/
+__pycache__/
+*.pyc
+.env
+configuration.local.json
+*.mobileprovision
+*.p12
+*.p8
+*.pem
+*.key
+*.ipa
+*.zip
+.DS_Store
