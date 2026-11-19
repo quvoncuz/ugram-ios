@@ -13,8 +13,10 @@ ROOT = Path(__file__).resolve().parents[1]
 def credentials():
     api_id = os.environ.get('TELEGRAM_API_ID', '')
     api_hash = os.environ.get('TELEGRAM_API_HASH', '')
-    if not re.fullmatch(r'[1-9][0-9]*', api_id) or api_id in {'4', '6'}:
-        raise SystemExit('Set your own TELEGRAM_API_ID repository secret from my.telegram.org/apps.')
+    if not re.fullmatch(r'[1-9][0-9]*', api_id):
+        raise SystemExit('Set a valid TELEGRAM_API_ID repository secret.')
+    if api_id in {'4', '6'} and os.environ.get('UGRAM_ALLOW_TEST_API') != '1':
+        raise SystemExit('Published API IDs require the personal-testing workflow option. Use your own API ID for distribution.')
     if not re.fullmatch(r'[0-9a-fA-F]{32}', api_hash):
         raise SystemExit('Set TELEGRAM_API_HASH repository secret (32 hexadecimal characters).')
     return api_id, api_hash
