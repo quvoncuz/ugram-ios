@@ -70,6 +70,9 @@ jobs:
           python3 scripts/prepare.py .build/Telegram-iOS
           swift scripts/icon.swift .build/Telegram-iOS/Telegram/UgramAssets.xcassets/AppIcon.appiconset
 
+      - name: Test Ugram local history and feature syntax
+        run: bash .build/Telegram-iOS/ugram-tests/run.sh .build/Telegram-iOS
+
       - name: Build arm64 IPA
         run: bash scripts/build.sh .build/Telegram-iOS
 
