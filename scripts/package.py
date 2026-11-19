@@ -62,7 +62,8 @@ def package(ipa, output):
         'build_number': os.environ.get('GITHUB_RUN_NUMBER', '1'),
         'bundle_id': pin['bundle_id'], 'sha256': digest,
         'signing': 'ad-hoc placeholder; requires local Apple-account re-signing',
-        'ugram_android_features_ported': False,
+        'ugram_features': ['local-deleted-history', 'local-edit-history', 'cached-media-archive', 'share-as-copy', 'ghost-mode', 'local-content-filter', 'regex-message-filter', 'external-translators'],
+        'feature_validation': 'cloud build and automated checks; device verification pending',
     }, indent=2) + '\n')
     print('Device IPA packaged for local re-signing.')
 

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+from apply_features import apply_features
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -86,6 +87,7 @@ def prepare(source):
         raise SystemExit('Source is already prepared; use a fresh checkout for each build.')
     ios_rules_path = source / 'build-system/bazel-rules/rules_apple/apple/internal/ios_rules.bzl'
     ios_rules = unsigned_application_rule(ios_rules_path.read_text())
+    apply_features(source)
     build_path.write_text(build)
     bazelrc_path.write_text(bazelrc + flags)
     ios_rules_path.write_text(ios_rules)
