@@ -1,0 +1,1038 @@
+diff --git a/docs/state-sync.md b/docs/state-sync.md
+--- a/docs/state-sync.md
++++ b/docs/state-sync.md
+@@ -1112,3 +1112,22 @@
+   `docs/superpowers/specs/2026-10-15-difference-too-long-design.md` (the differenceTooLong rules).
+ - `docs/superpowers/plans/`: the stage plans, kept as history.
+ - `docs/superpowers/plans/2026-10-14-state-sync-foundation/followups.md`: what each stage parked.
++
++
++## Ugram local history overlay
++
++`UgramMessageArchive` snapshots already-stored cloud messages immediately before
++server update deletions and edits in `StateReplay+Messages`. It never suppresses
++Postbox deletion, tombstones, resource cleanup, pts advancement or server sync.
++Completed media is linked/copied into the account's separate `ugram-history`
++directory before the cache is removed. Storage failures are reported in Ugram's
++history UI and must not block sync. Secret, ephemeral, timed, paid and age-gated
++content is excluded. Offline history-gap cleanup is not a source of new archive
++entries; content that never reached the client cannot be reconstructed.
++
++Ghost receipts: read-state work is locally confirmed while suppression is on;
++receipt operation logs still finish and personal mention/reaction cleanup gets a
++nil result, never fabricated server pts. Typing and story workers complete their
++normal operation cleanup. Presence keeps its normal timer and sends offline.
++All settings default off. Turning receipts back on can reveal previous reads
++when a subsequent Telegram cumulative read watermark advances.
+diff --git a/submodules/TelegramCore/Sources/State/AccountViewTracker.swift b/submodules/TelegramCore/Sources/State/AccountViewTracker.swift
+--- a/submodules/TelegramCore/Sources/State/AccountViewTracker.swift
++++ b/submodules/TelegramCore/Sources/State/AccountViewTracker.swift
+@@ -982,6 +982,7 @@
+                     if let account = self.account {
+                         let signal = (account.postbox.transaction { transaction -> Signal<Void, NoError> in
+                             if let peer = transaction.getPeer(peerId), let inputPeer = apiInputPeer(peer) {
++                                if UgramPreferences.enabled(.hideRead) { return .complete() }
+                                 let request: Signal<Bool, MTRpcError>
+                                 switch inputPeer {
+                                 case .inputPeerChat, .inputPeerSelf, .inputPeerUser:
+diff --git a/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift b/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift
+--- a/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift
+@@ -53,7 +53,7 @@
+             }, queue: self.queue)
+             self.onlineTimer = timer
+             timer.start()
+-            request = self.network.request(Api.functions.account.updateStatus(offline: .boolFalse))
++            request = self.network.request(Api.functions.account.updateStatus(offline: UgramPreferences.enabled(.hideOnline) ? .boolTrue : .boolFalse))
+         } else {
+             self.onlineTimer?.invalidate()
+             self.onlineTimer = nil
+diff --git a/submodules/TelegramCore/Sources/State/ManagedConsumePersonalMessagesActions.swift b/submodules/TelegramCore/Sources/State/ManagedConsumePersonalMessagesActions.swift
+--- a/submodules/TelegramCore/Sources/State/ManagedConsumePersonalMessagesActions.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedConsumePersonalMessagesActions.swift
+@@ -253,8 +253,7 @@
+ 
+ private func synchronizeConsumeMessageContents(transaction: Transaction, postbox: Postbox, network: Network, stateManager: AccountStateManager, id: MessageId) -> Signal<Void, NoError> {
+     if id.peerId.namespace == Namespaces.Peer.CloudUser || id.peerId.namespace == Namespaces.Peer.CloudGroup {
+-        return network.request(Api.functions.messages.readMessageContents(id: [id.id]))
+-            |> map(Optional.init)
++        return ugramReadResult(network.request(Api.functions.messages.readMessageContents(id: [id.id])))
+             |> `catch` { _ -> Signal<Api.messages.AffectedMessages?, NoError> in
+                 return .single(nil)
+             }
+@@ -288,7 +287,7 @@
+             }
+     } else if id.peerId.namespace == Namespaces.Peer.CloudChannel {
+         if let peer = transaction.getPeer(id.peerId), let inputChannel = apiInputChannel(peer) {
+-            return network.request(Api.functions.channels.readMessageContents(channel: inputChannel, id: [id.id]))
++            return (ugramReadResult(network.request(Api.functions.channels.readMessageContents(channel: inputChannel, id: [id.id]))) |> map { $0 ?? .boolFalse })
+                 |> `catch` { _ -> Signal<Api.Bool, NoError> in
+                     return .single(.boolFalse)
+                 } |> mapToSignal { result -> Signal<Void, NoError> in
+@@ -322,8 +321,7 @@
+ 
+ private func synchronizeReadMessageReactionsOrPollVotes(transaction: Transaction, postbox: Postbox, network: Network, stateManager: AccountStateManager, id: MessageId) -> Signal<Void, NoError> {
+     if id.peerId.namespace == Namespaces.Peer.CloudUser || id.peerId.namespace == Namespaces.Peer.CloudGroup {
+-        return network.request(Api.functions.messages.readMessageContents(id: [id.id]))
+-        |> map(Optional.init)
++        return ugramReadResult(network.request(Api.functions.messages.readMessageContents(id: [id.id])))
+         |> `catch` { _ -> Signal<Api.messages.AffectedMessages?, NoError> in
+             return .single(nil)
+         }
+@@ -365,7 +363,7 @@
+         }
+     } else if id.peerId.namespace == Namespaces.Peer.CloudChannel {
+         if let peer = transaction.getPeer(id.peerId), let inputChannel = apiInputChannel(peer) {
+-            return network.request(Api.functions.channels.readMessageContents(channel: inputChannel, id: [id.id]))
++            return (ugramReadResult(network.request(Api.functions.channels.readMessageContents(channel: inputChannel, id: [id.id]))) |> map { $0 ?? .boolFalse })
+             |> `catch` { _ -> Signal<Api.Bool, NoError> in
+                 return .single(.boolFalse)
+             }
+diff --git a/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift b/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift
+--- a/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift
+@@ -142,6 +142,7 @@
+ }
+ 
+ private func requestActivity(postbox: Postbox, network: Network, accountPeerId: PeerId, peerId: PeerId, threadId: Int64?, activity: PeerInputActivity?) -> Signal<Void, NoError> {
++    if UgramPreferences.enabled(.hideTyping) { return .complete() }
+     return postbox.transaction { transaction -> Signal<Void, NoError> in
+         if let peer = transaction.getPeer(peerId) {
+             if peerId == accountPeerId {
+diff --git a/submodules/TelegramCore/Sources/State/ManagedSynchronizeConsumeMessageContentsOperations.swift b/submodules/TelegramCore/Sources/State/ManagedSynchronizeConsumeMessageContentsOperations.swift
+--- a/submodules/TelegramCore/Sources/State/ManagedSynchronizeConsumeMessageContentsOperations.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedSynchronizeConsumeMessageContentsOperations.swift
+@@ -110,6 +110,7 @@
+ }
+ 
+ private func synchronizeConsumeMessageContents(transaction: Transaction, network: Network, stateManager: AccountStateManager, peerId: PeerId, operation: SynchronizeConsumeMessageContentsOperation) -> Signal<Void, NoError> {
++    if UgramPreferences.enabled(.hideRead) { return .complete() }
+     if peerId.namespace == Namespaces.Peer.CloudUser || peerId.namespace == Namespaces.Peer.CloudGroup {
+         return network.request(Api.functions.messages.readMessageContents(id: operation.messageIds.map { $0.id }))
+         |> map(Optional.init)
+diff --git a/submodules/TelegramCore/Sources/State/ManagedSynchronizeMarkAllUnseenPersonalMessagesOperations.swift b/submodules/TelegramCore/Sources/State/ManagedSynchronizeMarkAllUnseenPersonalMessagesOperations.swift
+--- a/submodules/TelegramCore/Sources/State/ManagedSynchronizeMarkAllUnseenPersonalMessagesOperations.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedSynchronizeMarkAllUnseenPersonalMessagesOperations.swift
+@@ -117,6 +117,7 @@
+ }
+ 
+ private func synchronizeMarkAllUnseen(transaction: Transaction, postbox: Postbox, network: Network, stateManager: AccountStateManager, peerId: PeerId, operation: SynchronizeMarkAllUnseenPersonalMessagesOperation) -> Signal<Void, NoError> {
++    if UgramPreferences.enabled(.hideRead) { return .complete() }
+     guard let inputPeer = transaction.getPeer(peerId).flatMap(apiInputPeer) else {
+         return .complete()
+     }
+diff --git a/submodules/TelegramCore/Sources/State/ManagedSynchronizeViewStoriesOperations.swift b/submodules/TelegramCore/Sources/State/ManagedSynchronizeViewStoriesOperations.swift
+--- a/submodules/TelegramCore/Sources/State/ManagedSynchronizeViewStoriesOperations.swift
++++ b/submodules/TelegramCore/Sources/State/ManagedSynchronizeViewStoriesOperations.swift
+@@ -119,6 +119,7 @@
+ }
+ 
+ private func pushStoriesAreSeen(postbox: Postbox, network: Network, stateManager: AccountStateManager, peer: Peer, operation: SynchronizeViewStoriesOperation) -> Signal<Void, NoError> {
++    if UgramPreferences.enabled(.hideStories) { return .complete() }
+     guard let inputPeer = apiInputPeer(peer) else {
+         return .complete()
+     }
+diff --git a/submodules/TelegramCore/Sources/State/Sync/StateReplay+Messages.swift b/submodules/TelegramCore/Sources/State/Sync/StateReplay+Messages.swift
+--- a/submodules/TelegramCore/Sources/State/Sync/StateReplay+Messages.swift
++++ b/submodules/TelegramCore/Sources/State/Sync/StateReplay+Messages.swift
+@@ -274,6 +274,9 @@
+     }
+     
+     func applyDeleteMessagesWithGlobalIds(_ ids: [Int32]) {
++        for id in transaction.messageIdsForGlobalIds(ids) {
++            if let message = transaction.getMessage(id) { ugramArchiveMessage(message, mediaBox: mediaBox, kind: "deleted") }
++        }
+         var resourceIds: [MediaResourceId] = []
+         transaction.deleteMessagesWithGlobalIds(ids, forEachMedia: { media in
+             addMessageMediaResourceIdsToRemove(media: media, resourceIds: &resourceIds)
+@@ -285,6 +288,9 @@
+     }
+     
+     func applyDeleteMessages(_ ids: [MessageId]) {
++        for id in ids {
++            if let message = transaction.getMessage(id) { ugramArchiveMessage(message, mediaBox: mediaBox, kind: "deleted") }
++        }
+         _internal_deleteMessages(transaction: transaction, mediaBox: mediaBox, ids: ids, manualAddMessageThreadStatsDifference: { id, add, remove in
+             self.addMessageThreadStatsDifference(threadKey: id, remove: remove, addedMessagePeer: nil, addedMessageId: nil, isOutgoing: false)
+         })
+@@ -305,6 +311,9 @@
+     }
+     
+     func applyEditMessage(_ id: MessageId, _ message: StoreMessage) {
++        if let previous = transaction.getMessage(id) {
++            ugramArchiveMessage(previous, mediaBox: mediaBox, kind: "edited")
++        }
+         var generatedEvent: (reactionAuthor: Peer, reaction: MessageReaction.Reaction, message: Message, timestamp: Int32)?
+         transaction.updateMessage(id, update: { previousMessage in
+             let peers: [PeerId:Peer] = previousMessage.peers.reduce([:], { current, value in
+diff --git a/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift b/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift
+--- a/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift
++++ b/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift
+@@ -425,6 +425,9 @@
+ }
+ 
+ func synchronizePeerReadState(network: Network, postbox: Postbox, stateManager: AccountStateManager, peerId: PeerId, push: Bool, validate: Bool) -> Signal<Never, PeerReadStateValidationError> {
++    if UgramPreferences.enabled(.hideRead) {
++        return confirmSynchronized(postbox: postbox, peerId: peerId) |> ignoreValues
++    }
+     // A channel the account is not a member of has no read state on the server
+     // (NonMemberChannelReadState.swift): nothing is pushed or validated, and the queued operation
+     // is confirmed so the manager does not pick it up again. This also covers paths that queue one
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Messages/ApplyMaxReadIndexInteractively.swift b/submodules/TelegramCore/Sources/TelegramEngine/Messages/ApplyMaxReadIndexInteractively.swift
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Messages/ApplyMaxReadIndexInteractively.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Messages/ApplyMaxReadIndexInteractively.swift
+@@ -219,7 +219,9 @@
+             
+             if peer.isForum {
+                 if let inputPeer = apiInputPeer(peer) {
+-                    let _ = network.request(Api.functions.messages.readDiscussion(peer: inputPeer, msgId: Int32(clamping: threadId), readMaxId: messageIndex.id.id)).start()
++                    if !UgramPreferences.enabled(.hideRead) {
++                        let _ = network.request(Api.functions.messages.readDiscussion(peer: inputPeer, msgId: Int32(clamping: threadId), readMaxId: messageIndex.id.id)).start()
++                    }
+                 }
+             } else if peer.isMonoForum {
+                 if let inputPeer = apiInputPeer(peer), let subPeer = transaction.getPeer(PeerId(threadId)).flatMap(apiInputPeer) {
+@@ -255,7 +257,9 @@
+         
+         if peer.isForum {
+             if let inputPeer = apiInputPeer(peer) {
+-                let _ = network.request(Api.functions.messages.readDiscussion(peer: inputPeer, msgId: Int32(clamping: threadId), readMaxId: messageIndex.id.id)).start()
++                if !UgramPreferences.enabled(.hideRead) {
++                    let _ = network.request(Api.functions.messages.readDiscussion(peer: inputPeer, msgId: Int32(clamping: threadId), readMaxId: messageIndex.id.id)).start()
++                }
+             }
+         } else if peer.isMonoForum {
+             if let inputPeer = apiInputPeer(peer), let subPeer = transaction.getPeer(PeerId(threadId)).flatMap(apiInputPeer) {
+@@ -297,7 +301,9 @@
+                 
+                 if peer.isForum {
+                     if let inputPeer = apiInputPeer(peer) {
+-                        let _ = network.request(Api.functions.messages.readDiscussion(peer: inputPeer, msgId: Int32(clamping: item.threadId), readMaxId: messageIndex.id.id)).start()
++                        if !UgramPreferences.enabled(.hideRead) {
++                            let _ = network.request(Api.functions.messages.readDiscussion(peer: inputPeer, msgId: Int32(clamping: item.threadId), readMaxId: messageIndex.id.id)).start()
++                        }
+                     }
+                 } else if peer.isMonoForum {
+                     if let inputPeer = apiInputPeer(peer), let subPeer = transaction.getPeer(PeerId(item.threadId)).flatMap(apiInputPeer) {
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Messages/MarkAllChatsAsRead.swift b/submodules/TelegramCore/Sources/TelegramEngine/Messages/MarkAllChatsAsRead.swift
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Messages/MarkAllChatsAsRead.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Messages/MarkAllChatsAsRead.swift
+@@ -6,6 +6,7 @@
+ 
+ 
+ func _internal_markAllChatsAsRead(postbox: Postbox, network: Network, stateManager: AccountStateManager) -> Signal<Void, NoError> {
++    if UgramPreferences.enabled(.hideRead) { return .complete() }
+     return network.request(Api.functions.messages.getDialogUnreadMarks(flags: 0, parentPeer: nil))
+     |> map(Optional.init)
+     |> `catch` { _ -> Signal<[Api.DialogPeer]?, NoError> in
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Messages/ReplyThreadHistory.swift b/submodules/TelegramCore/Sources/TelegramEngine/Messages/ReplyThreadHistory.swift
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Messages/ReplyThreadHistory.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Messages/ReplyThreadHistory.swift
+@@ -227,6 +227,7 @@
+     }
+     
+     func applyMaxReadIndex(messageIndex: MessageIndex) {
++        if UgramPreferences.enabled(.hideRead) { return }
+         let peerId = self.peerId
+         let threadId = self.threadId
+         
+diff --git a/submodules/TelegramCore/Sources/UgramLocalStore.swift b/submodules/TelegramCore/Sources/UgramLocalStore.swift
+new file mode 100644
+--- /dev/null
++++ b/submodules/TelegramCore/Sources/UgramLocalStore.swift
+@@ -0,0 +1,167 @@
++import Foundation
++
++/// Device-local preferences. No message content or preference is sent to a server.
++public enum UgramPreferences {
++    public enum Flag: String, CaseIterable {
++        case saveDeleted, saveEdits, saveMedia, shareCopies, hideRead, hideStories, hideTyping, hideOnline, showRestricted
++    }
++    public static func enabled(_ flag: Flag) -> Bool {
++        return UserDefaults.standard.bool(forKey: "ugram." + flag.rawValue)
++    }
++    public static func set(_ flag: Flag, _ value: Bool) {
++        UserDefaults.standard.set(value, forKey: "ugram." + flag.rawValue)
++    }
++}
++
++public struct UgramArchiveEntry: Codable, Equatable {
++    public let id: String
++    public let peerId: Int64
++    public let messageId: Int32
++    public let timestamp: Int32
++    public let capturedAt: Double
++    public let kind: String
++    public let chat: String
++    public let author: String
++    public let text: String
++    public var attachments: [String]
++    public var missingMedia: Bool
++
++    public init(peerId: Int64, messageId: Int32, timestamp: Int32, kind: String, chat: String, author: String, text: String, missingMedia: Bool) {
++        self.id = UUID().uuidString
++        self.peerId = peerId
++        self.messageId = messageId
++        self.timestamp = timestamp
++        self.capturedAt = Date().timeIntervalSince1970
++        self.kind = kind
++        self.chat = chat
++        self.author = author
++        self.text = text
++        self.attachments = []
++        self.missingMedia = missingMedia
++    }
++}
++
++/// A separate archive below the account directory, outside Telegram's disposable media cache.
++/// Completed media is hard-linked before the original is removed; copying is the fallback.
++public final class UgramLocalArchive {
++    private static let lock = NSRecursiveLock()
++    private static var index: [String: [UgramArchiveEntry]] = [:]
++    private static var sizes: [String: Int64] = [:]
++    public let directory: URL
++    public static let maximumEntries = 5000
++    public static let maximumBytes: Int64 = 1024 * 1024 * 1024
++    private let entryLimit: Int
++    private let byteLimit: Int64
++
++    public init(accountPath: String, entryLimit: Int = UgramLocalArchive.maximumEntries, byteLimit: Int64 = UgramLocalArchive.maximumBytes) {
++        self.directory = URL(fileURLWithPath: accountPath, isDirectory: true).appendingPathComponent("ugram-history", isDirectory: true)
++        self.entryLimit = max(1, entryLimit)
++        self.byteLimit = max(1, byteLimit)
++    }
++
++    private func prepare() throws {
++        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
++        var url = directory
++        var values = URLResourceValues()
++        values.isExcludedFromBackup = true
++        try url.setResourceValues(values)
++        #if os(iOS)
++        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: directory.path)
++        #endif
++    }
++
++    public func entries(peerId: Int64? = nil) throws -> [UgramArchiveEntry] {
++        Self.lock.lock()
++        defer { Self.lock.unlock() }
++        if let entries = Self.index[directory.path] {
++            return entries.filter { peerId == nil || $0.peerId == peerId }
++        }
++        guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
++        let entries = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
++            .filter { $0.pathExtension == "json" }
++            .compactMap { try? JSONDecoder().decode(UgramArchiveEntry.self, from: Data(contentsOf: $0)) }
++            .sorted { $0.capturedAt > $1.capturedAt }
++        Self.index[directory.path] = entries
++        return entries.filter { peerId == nil || $0.peerId == peerId }
++    }
++
++    public func append(_ entry: UgramArchiveEntry, files: [(path: String, name: String)]) throws {
++        Self.lock.lock()
++        defer { Self.lock.unlock() }
++        try prepare()
++        let previous = try entries()
++        var stored = entry
++        let eventDirectory = directory.appendingPathComponent(entry.id, isDirectory: true)
++        try FileManager.default.createDirectory(at: eventDirectory, withIntermediateDirectories: true)
++        do {
++            for (index, file) in files.enumerated() {
++                let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?.int64Value ?? 0
++                guard size > 0, size <= byteLimit else {
++                    stored.missingMedia = true
++                    continue
++                }
++                let name = "\(index)-" + URL(fileURLWithPath: file.name).lastPathComponent
++                let destination = eventDirectory.appendingPathComponent(name)
++                do {
++                    do {
++                        try FileManager.default.linkItem(atPath: file.path, toPath: destination.path)
++                    } catch {
++                        try FileManager.default.copyItem(atPath: file.path, toPath: destination.path)
++                    }
++                    stored.attachments.append(entry.id + "/" + name)
++                    Self.sizes[destination.path] = size
++                } catch {
++                    stored.missingMedia = true
++                }
++            }
++            let encoded = try JSONEncoder().encode(stored)
++            try encoded.write(to: directory.appendingPathComponent(entry.id + ".json"), options: .atomic)
++            Self.index[directory.path] = ([stored] + previous).sorted { $0.capturedAt > $1.capturedAt }
++        } catch {
++            try? FileManager.default.removeItem(at: eventDirectory)
++            throw error
++        }
++        try trim()
++    }
++
++    public func attachmentURL(_ relativePath: String) -> URL? {
++        let result = directory.appendingPathComponent(relativePath).standardizedFileURL
++        guard result.path.hasPrefix(directory.standardizedFileURL.path + "/"), FileManager.default.fileExists(atPath: result.path) else { return nil }
++        return result
++    }
++
++    private func trim() throws {
++        var used: Int64 = 0
++        for (index, entry) in try entries().enumerated() {
++            for attachment in entry.attachments {
++                if let url = attachmentURL(attachment) {
++                    let size = Self.sizes[url.path] ?? (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
++                    Self.sizes[url.path] = size
++                    used += size
++                }
++            }
++            if index >= entryLimit || used > byteLimit {
++                try remove(entry)
++            }
++        }
++    }
++
++    public func remove(_ entry: UgramArchiveEntry) throws {
++        Self.lock.lock()
++        defer { Self.lock.unlock() }
++        guard UUID(uuidString: entry.id) != nil else { return }
++        let assets = directory.appendingPathComponent(entry.id)
++        if FileManager.default.fileExists(atPath: assets.path) { try FileManager.default.removeItem(at: assets) }
++        try FileManager.default.removeItem(at: directory.appendingPathComponent(entry.id + ".json"))
++        Self.index[directory.path]?.removeAll { $0.id == entry.id }
++        for attachment in entry.attachments { Self.sizes.removeValue(forKey: directory.appendingPathComponent(attachment).path) }
++    }
++
++    public func clear() throws {
++        Self.lock.lock()
++        defer { Self.lock.unlock() }
++        if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) }
++        Self.index.removeValue(forKey: directory.path)
++        Self.sizes = Self.sizes.filter { !$0.key.hasPrefix(directory.path + "/") }
++    }
++}
+diff --git a/submodules/TelegramCore/Sources/UgramMessageArchive.swift b/submodules/TelegramCore/Sources/UgramMessageArchive.swift
+new file mode 100644
+--- /dev/null
++++ b/submodules/TelegramCore/Sources/UgramMessageArchive.swift
+@@ -0,0 +1,50 @@
++import Foundation
++import Postbox
++
++public func ugramCanKeepMessage(_ message: Message) -> Bool {
++    guard message.id.peerId.namespace != Namespaces.Peer.SecretChat,
++          message.id.namespace == Namespaces.Message.Cloud,
++          message.paidContent == nil,
++          message.activeEphemeralReplacementMessage == nil else { return false }
++    // Preserve the native handling of self-destructing and age-gated content.
++    if message.attributes.contains(where: { $0 is AutoremoveTimeoutMessageAttribute || $0 is AutoclearTimeoutMessageAttribute }) { return false }
++    if message.isSensitiveContent(platform: "ios", contentSettings: .default) { return false }
++    return !message.media.contains(where: { $0 is TelegramMediaAction || $0 is TelegramMediaInvoice })
++}
++
++public func ugramArchiveForMediaBox(_ mediaBox: MediaBox) -> UgramLocalArchive {
++    let accountPath = URL(fileURLWithPath: mediaBox.basePath).deletingLastPathComponent().deletingLastPathComponent().path
++    return UgramLocalArchive(accountPath: accountPath)
++}
++
++func ugramArchiveMessage(_ message: Message, mediaBox: MediaBox, kind: String) {
++    guard UgramPreferences.enabled(kind == "deleted" ? .saveDeleted : .saveEdits), ugramCanKeepMessage(message) else { return }
++    var files: [(path: String, name: String)] = []
++    var missingMedia = false
++    for media in message.media {
++        var resource: MediaResource?
++        var name = "media"
++        if let file = media as? TelegramMediaFile {
++            resource = file.resource
++            name = file.fileName ?? (file.isVideo ? "video.mp4" : file.isVoice ? "voice.ogg" : "file")
++        } else if let image = media as? TelegramMediaImage {
++            resource = image.representations.max(by: { $0.dimensions.width * $0.dimensions.height < $1.dimensions.width * $1.dimensions.height })?.resource
++            name = "photo.jpg"
++        }
++        if let resource = resource {
++            if UgramPreferences.enabled(.saveMedia), let path = mediaBox.completedResourcePath(resource) {
++                files.append((path, name))
++            } else {
++                missingMedia = true
++            }
++        }
++    }
++    let entry = UgramArchiveEntry(peerId: message.id.peerId.toInt64(), messageId: message.id.id, timestamp: message.timestamp, kind: kind,
++        chat: message.peers[message.id.peerId]?.debugDisplayTitle ?? "Chat", author: message.author?.debugDisplayTitle ?? "", text: message.text, missingMedia: missingMedia)
++    do {
++        try ugramArchiveForMediaBox(mediaBox).append(entry, files: files)
++    } catch {
++        // Never prevent Telegram's sync or deletion from completing if storage is full.
++        UserDefaults.standard.set("Mahalliy tarixni saqlab bo‘lmadi. Bo‘sh joyni tekshiring.", forKey: "ugram.archiveError")
++    }
++}
+diff --git a/submodules/TelegramCore/Sources/UgramMessageFilter.swift b/submodules/TelegramCore/Sources/UgramMessageFilter.swift
+new file mode 100644
+--- /dev/null
++++ b/submodules/TelegramCore/Sources/UgramMessageFilter.swift
+@@ -0,0 +1,28 @@
++import Foundation
++
++public enum UgramMessageFilter {
++    private static let lock = NSLock()
++    private static var previousPattern = ""
++    private static var expression: NSRegularExpression?
++
++    public static func matches(_ text: String) -> Bool {
++        let pattern = UserDefaults.standard.string(forKey: "ugram.filter") ?? ""
++        guard !pattern.isEmpty, pattern.count <= 512 else { return false }
++        lock.lock()
++        if pattern != previousPattern {
++            previousPattern = pattern
++            expression = try? NSRegularExpression(pattern: pattern)
++        }
++        let expression = self.expression
++        lock.unlock()
++        guard let expression = expression else { return false }
++        let bounded = String(text.prefix(16000))
++        let deadline = Date().timeIntervalSinceReferenceDate + 0.005
++        var found = false
++        expression.enumerateMatches(in: bounded, options: [.reportProgress], range: NSRange(bounded.startIndex..., in: bounded)) { result, _, stop in
++            if result != nil { found = true; stop.pointee = true }
++            else if Date().timeIntervalSinceReferenceDate > deadline { stop.pointee = true }
++        }
++        return found
++    }
++}
+diff --git a/submodules/TelegramCore/Sources/UgramReadResult.swift b/submodules/TelegramCore/Sources/UgramReadResult.swift
+new file mode 100644
+--- /dev/null
++++ b/submodules/TelegramCore/Sources/UgramReadResult.swift
+@@ -0,0 +1,11 @@
++import Foundation
++import SwiftSignalKit
++import MtProtoKit
++
++/// Suppressed receipts still reach the caller's local cleanup as nil. Never fabricate pts/updates.
++func ugramReadResult<T>(_ request: Signal<T, MTRpcError>) -> Signal<T?, MTRpcError> {
++    return deferred {
++        if UgramPreferences.enabled(.hideRead) { return .single(nil) }
++        return request |> map(Optional.init)
++    }
++}
+diff --git a/submodules/TelegramCore/Sources/Utils/PeerUtils.swift b/submodules/TelegramCore/Sources/Utils/PeerUtils.swift
+--- a/submodules/TelegramCore/Sources/Utils/PeerUtils.swift
++++ b/submodules/TelegramCore/Sources/Utils/PeerUtils.swift
+@@ -6,6 +6,7 @@
+ public extension RestrictionRule {
+     // The server may join several platforms with a dash ("ios-android").
+     func appliesTo(platform: String, contentSettings: ContentSettings) -> Bool {
++        if self.reason != "sensitive" && UgramPreferences.enabled(.showRestricted) { return false }
+         return self.platform.split(separator: "-").contains(where: { component in
+             let component = String(component)
+             return component == "all" || component == platform || contentSettings.addContentRestrictionReasons.contains(component)
+diff --git a/submodules/TelegramUI/Sources/ChatHistoryEntriesForView.swift b/submodules/TelegramUI/Sources/ChatHistoryEntriesForView.swift
+--- a/submodules/TelegramUI/Sources/ChatHistoryEntriesForView.swift
++++ b/submodules/TelegramUI/Sources/ChatHistoryEntriesForView.swift
+@@ -171,6 +171,7 @@
+     var count = 0
+     loop: for entry in view.entries {
+         var message = entry.message.withAppliedEphemeralReplacementMessage()
++        if message.flags.contains(.Incoming) && UgramMessageFilter.matches(message.text) { continue }
+         var isRead = entry.isRead
+         
+         var pinToTop = false
+diff --git a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+--- a/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
++++ b/submodules/TelegramUI/Sources/ChatInterfaceStateContextMenus.swift
+@@ -965,6 +965,24 @@
+         let isPremium = accountPeer?.isPremium ?? false
+ 
+         var actions: [ContextMenuItem] = []
++
++        actions.append(.action(ContextMenuActionItem(text: "Ugram · Ma’lumot va tarjima", icon: { _ in UIImage(systemName: "info.circle") }, action: { c, _ in
++            c?.dismiss(completion: {
++                controllerInteraction.presentController(ugramMessageTools(context: context, message: message), nil)
++            })
++        })))
++        actions.append(.action(ContextMenuActionItem(text: "Ugram · Chat tarixi", icon: { _ in UIImage(systemName: "clock.arrow.circlepath") }, action: { c, _ in
++            c?.dismiss(completion: {
++                controllerInteraction.presentController(makeUgramController(context: context, peerId: message.id.peerId.toInt64(), history: true), nil)
++            })
++        })))
++        if ugramCanShareCopy(message) {
++            actions.append(.action(ContextMenuActionItem(text: "Ugram · Nusxa sifatida ulashish", icon: { _ in UIImage(systemName: "square.and.arrow.up") }, action: { c, _ in
++                c?.dismiss(completion: {
++                    ugramPresentCopy(context: context, message: message, present: { controller in controllerInteraction.presentController(controller, nil) })
++                })
++            })))
++        }
+ 
+         if isSharedMediaPolls && messages.count == 1 {
+             actions.append(.action(ContextMenuActionItem(text: chatPresentationInterfaceState.strings.SharedMedia_ViewInChat, icon: { theme in
+diff --git a/submodules/TelegramUI/Sources/TelegramRootController.swift b/submodules/TelegramUI/Sources/TelegramRootController.swift
+--- a/submodules/TelegramUI/Sources/TelegramRootController.swift
++++ b/submodules/TelegramUI/Sources/TelegramRootController.swift
+@@ -84,6 +84,7 @@
+     public var callListController: CallListController?
+     public var chatListController: ChatListController?
+     public var accountSettingsController: PeerInfoScreen?
++    private var ugramController: ViewController?
+     public var newsController: NewsScreen?
+     
+     private var permissionsDisposable: Disposable?
+@@ -239,6 +240,9 @@
+             strongSelf.pushViewController(debugController(sharedContext: strongSelf.context.sharedContext, context: strongSelf.context))
+         }
+         accountSettingsController.parentController = self
++        let ugramController = makeUgramController(context: self.context, modal: false)
++        self.ugramController = ugramController
++        controllers.append(ugramController)
+         controllers.append(accountSettingsController)
+                 
+         let chatsIndex = controllers.firstIndex(where: { $0 === chatListController }) ?? 0
+@@ -264,6 +268,7 @@
+             controllers.append(newsController)
+         }
+         controllers.append(self.chatListController!)
++        if let ugramController = self.ugramController { controllers.append(ugramController) }
+         controllers.append(self.accountSettingsController!)
+ 
+         // A removed selected tab would otherwise fall back to index 0: select Chats instead.
+diff --git a/submodules/TelegramUI/Sources/UgramControllers.swift b/submodules/TelegramUI/Sources/UgramControllers.swift
+new file mode 100644
+--- /dev/null
++++ b/submodules/TelegramUI/Sources/UgramControllers.swift
+@@ -0,0 +1,162 @@
++import Foundation
++import UIKit
++import QuickLook
++import Display
++import LegacyUI
++import TelegramCore
++import AccountContext
++
++func makeUgramController(context: AccountContext, peerId: Int64? = nil, history: Bool = false, modal: Bool = true) -> ViewController {
++    let wrapper = LegacyController(presentation: modal ? .modal(animateIn: true) : .custom, theme: context.sharedContext.currentPresentationData.with { $0 }.theme)
++    let archive = ugramArchiveForMediaBox(context.account.postbox.mediaBox)
++    let root: UIViewController = history ? UgramHistoryController(archive: archive, peerId: peerId) : UgramSettingsController(archive: archive)
++    if modal {
++        root.navigationItem.leftBarButtonItem = UIBarButtonItem(systemItem: .done, primaryAction: UIAction { [weak wrapper] _ in wrapper?.dismiss() })
++    }
++    wrapper.bind(controller: UINavigationController(rootViewController: root))
++    wrapper.tabBarItem.title = "Ugram"
++    wrapper.tabBarItem.image = UIImage(systemName: "slider.horizontal.3")
++    return wrapper
++}
++
++private func ugramAlert(_ controller: UIViewController, _ text: String) {
++    let alert = UIAlertController(title: "Ugram", message: text, preferredStyle: .alert)
++    alert.addAction(UIAlertAction(title: "OK", style: .default))
++    controller.present(alert, animated: true)
++}
++
++private final class UgramSettingsController: UITableViewController {
++    private let archive: UgramLocalArchive
++    private let groups: [[(String, UgramPreferences.Flag)]] = [
++        [("O‘chirilgan xabarlarni saqlash", .saveDeleted), ("Tahrirlar tarixini saqlash", .saveEdits), ("Yuklangan media nusxasini saqlash", .saveMedia), ("Nusxa sifatida ulashish", .shareCopies), ("Mahalliy kontent cheklovlarini yumshatish", .showRestricted)],
++        [("O‘qilganlikni yubormaslik", .hideRead), ("Hikoya ko‘rilganligini yubormaslik", .hideStories), ("Yozish indikatorini yubormaslik", .hideTyping), ("Onlayn holatini yubormaslik", .hideOnline)]
++    ]
++    init(archive: UgramLocalArchive) { self.archive = archive; super.init(style: .insetGrouped) }
++    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
++    override func viewDidLoad() { super.viewDidLoad(); title = "Ugram sozlamalari" }
++    override func numberOfSections(in tableView: UITableView) -> Int { return 3 }
++    override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { return section < 2 ? groups[section].count : 3 }
++    override func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? { return ["Kontent va tarix", "Ghost mode", "Mahalliy ma’lumotlar"][section] }
++    override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
++        if section == 0 { return "Faqat ushbu ilova qabul qilgan xabarlar va to‘liq yuklangan media saqlanadi. Tarix alohida oynada ko‘rsatiladi. Bir martalik, muddati cheklangan, maxfiy va pullik media saqlanmaydi. Kontent tugmasi server ruxsati yoki yosh tekshiruvini o‘zgartirmaydi." }
++        if section == 1 { return "Sozlamalar shu qurilmadagi barcha hisoblarga tegishli. Boshqa qurilmadagi sessiyalar holat yuborishi mumkin. Onlayn sozlamasi keyingi holat yangilanishida, odatda 30 soniya ichida amal qiladi." }
++        return "Tarix har bir hisob uchun alohida. Limit: 5 000 yozuv va 1 GB media; eng eski yozuvlar avtomatik tozalanadi. iCloud zaxirasiga kiritilmaydi. Filtrni o‘zgartirgach chatni qayta oching."
++    }
++    override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
++        let cell = UITableViewCell(style: .subtitle, reuseIdentifier: nil)
++        cell.textLabel?.numberOfLines = 0
++        if indexPath.section < 2 {
++            let (name, flag) = groups[indexPath.section][indexPath.row]
++            cell.textLabel?.text = name
++            let toggle = UISwitch()
++            toggle.isOn = UgramPreferences.enabled(flag)
++            toggle.addAction(UIAction { [weak toggle] _ in
++                if let toggle = toggle { UgramPreferences.set(flag, toggle.isOn) }
++            }, for: .valueChanged)
++            cell.accessoryView = toggle
++            cell.selectionStyle = .none
++        } else {
++            cell.textLabel?.text = ["O‘chirilgan xabarlar va tahrirlar tarixi", "Xabar filtri (regex)", "Mahalliy tarixni tozalash"][indexPath.row]
++            cell.accessoryType = .disclosureIndicator
++            if indexPath.row == 2 { cell.textLabel?.textColor = .systemRed }
++        }
++        return cell
++    }
++    override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
++        tableView.deselectRow(at: indexPath, animated: true)
++        guard indexPath.section == 2 else { return }
++        if indexPath.row == 0 {
++            navigationController?.pushViewController(UgramHistoryController(archive: archive, peerId: nil), animated: true)
++        } else if indexPath.row == 1 {
++            let alert = UIAlertController(title: "Regex filtri", message: "Mos keladigan kiruvchi xabarlar chatda yashiriladi. Bo‘sh maydon filtrni o‘chiradi. Xabarlar serverdan o‘chirilmaydi.", preferredStyle: .alert)
++            alert.addTextField { $0.text = UserDefaults.standard.string(forKey: "ugram.filter") }
++            alert.addAction(UIAlertAction(title: "Bekor qilish", style: .cancel))
++            alert.addAction(UIAlertAction(title: "Saqlash", style: .default, handler: { [weak self, weak alert] _ in
++                guard let self = self else { return }
++                let pattern = alert?.textFields?.first?.text ?? ""
++                guard pattern.count <= 512, pattern.isEmpty || (try? NSRegularExpression(pattern: pattern)) != nil else {
++                    ugramAlert(self, "Regex noto‘g‘ri yoki 512 belgidan uzun."); return
++                }
++                UserDefaults.standard.set(pattern, forKey: "ugram.filter")
++            }))
++            present(alert, animated: true)
++        } else {
++            let alert = UIAlertController(title: "Tarix tozalansinmi?", message: "Faqat shu hisobning Ugram mahalliy arxivi o‘chadi. Bu amalni qaytarib bo‘lmaydi.", preferredStyle: .alert)
++            alert.addAction(UIAlertAction(title: "Bekor qilish", style: .cancel))
++            alert.addAction(UIAlertAction(title: "Tozalash", style: .destructive, handler: { [weak self] _ in
++                guard let self = self else { return }
++                do { try self.archive.clear(); UserDefaults.standard.removeObject(forKey: "ugram.archiveError") }
++                catch { ugramAlert(self, "Tarixni tozalab bo‘lmadi.") }
++            }))
++            present(alert, animated: true)
++        }
++    }
++}
++
++private final class UgramHistoryController: UITableViewController {
++    private let archive: UgramLocalArchive
++    private let peerId: Int64?
++    private var entries: [UgramArchiveEntry] = []
++    init(archive: UgramLocalArchive, peerId: Int64?) { self.archive = archive; self.peerId = peerId; super.init(style: .insetGrouped) }
++    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
++    override func viewDidLoad() {
++        super.viewDidLoad(); title = "Mahalliy tarix"
++        refreshControl = UIRefreshControl()
++        refreshControl?.addTarget(self, action: #selector(reload), for: .valueChanged)
++        reload()
++    }
++    @objc private func reload() {
++        do { entries = try archive.entries(peerId: peerId) }
++        catch { ugramAlert(self, "Tarixni o‘qib bo‘lmadi.") }
++        refreshControl?.endRefreshing(); tableView.reloadData()
++    }
++    override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { return entries.count }
++    override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
++        if let error = UserDefaults.standard.string(forKey: "ugram.archiveError") { return error }
++        return entries.isEmpty ? "Hali saqlangan xabar yo‘q. Ugram sozlamalarida tarixni yoqing. Ilovaga oldin kelmagan xabarlarni tiklab bo‘lmaydi." : nil
++    }
++    override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
++        let entry = entries[indexPath.row]
++        let cell = UITableViewCell(style: .subtitle, reuseIdentifier: nil)
++        cell.textLabel?.text = (entry.kind == "deleted" ? "🗑 " : "✎ ") + (entry.text.isEmpty ? "Media" : entry.text)
++        cell.textLabel?.numberOfLines = 3
++        cell.detailTextLabel?.text = entry.chat + " · " + entry.author
++        cell.accessoryType = .disclosureIndicator
++        return cell
++    }
++    override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
++        tableView.deselectRow(at: indexPath, animated: true)
++        navigationController?.pushViewController(UgramArchiveDetailController(archive: archive, entry: entries[indexPath.row]), animated: true)
++    }
++}
++
++private final class UgramArchiveDetailController: UITableViewController, QLPreviewControllerDataSource {
++    private let archive: UgramLocalArchive
++    private let entry: UgramArchiveEntry
++    private var previewURL: URL?
++    init(archive: UgramLocalArchive, entry: UgramArchiveEntry) { self.archive = archive; self.entry = entry; super.init(style: .insetGrouped) }
++    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
++    override func viewDidLoad() { super.viewDidLoad(); title = entry.kind == "deleted" ? "O‘chirilgan xabar" : "Oldingi tahrir" }
++    override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { return 2 + entry.attachments.count }
++    override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
++        let cell = UITableViewCell(style: .subtitle, reuseIdentifier: nil)
++        cell.textLabel?.numberOfLines = 0
++        if indexPath.row == 0 { cell.textLabel?.text = entry.text.isEmpty ? "Matnsiz xabar" : entry.text }
++        else if indexPath.row == 1 {
++            cell.textLabel?.text = entry.chat + " · " + entry.author
++            cell.detailTextLabel?.numberOfLines = 0
++            cell.detailTextLabel?.text = Date(timeIntervalSince1970: Double(entry.timestamp)).description + (entry.missingMedia ? "\nMedia nusxasi to‘liq saqlanmagan yoki yuklanmagan." : "")
++        } else { cell.textLabel?.text = URL(fileURLWithPath: entry.attachments[indexPath.row - 2]).lastPathComponent; cell.accessoryType = .disclosureIndicator }
++        return cell
++    }
++    override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
++        tableView.deselectRow(at: indexPath, animated: true)
++        if indexPath.row == 0 { UIPasteboard.general.string = entry.text; ugramAlert(self, "Matn nusxalandi."); return }
++        guard indexPath.row >= 2, let url = archive.attachmentURL(entry.attachments[indexPath.row - 2]) else { return }
++        previewURL = url
++        let preview = QLPreviewController(); preview.dataSource = self
++        present(preview, animated: true)
++    }
++    func numberOfPreviewItems(in controller: QLPreviewController) -> Int { return previewURL == nil ? 0 : 1 }
++    func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem { return previewURL! as NSURL }
++}
+diff --git a/submodules/TelegramUI/Sources/UgramMessageTools.swift b/submodules/TelegramUI/Sources/UgramMessageTools.swift
+new file mode 100644
+--- /dev/null
++++ b/submodules/TelegramUI/Sources/UgramMessageTools.swift
+@@ -0,0 +1,60 @@
++import Foundation
++import UIKit
++import Postbox
++import TelegramCore
++import Display
++import LegacyUI
++import AccountContext
++
++func ugramMessageTools(context: AccountContext, message: Message) -> ViewController {
++    let wrapper = LegacyController(presentation: .modal(animateIn: true), theme: context.sharedContext.currentPresentationData.with { $0 }.theme)
++    let controller = UgramMessageToolsController(context: context, message: message)
++    controller.navigationItem.leftBarButtonItem = UIBarButtonItem(systemItem: .done, primaryAction: UIAction { [weak wrapper] _ in wrapper?.dismiss() })
++    wrapper.bind(controller: UINavigationController(rootViewController: controller))
++    return wrapper
++}
++
++private final class UgramMessageToolsController: UITableViewController {
++    private let context: AccountContext
++    private let message: Message
++    init(context: AccountContext, message: Message) { self.context = context; self.message = message; super.init(style: .insetGrouped) }
++    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
++    override func viewDidLoad() { super.viewDidLoad(); title = "Xabar ma’lumotlari" }
++    override func numberOfSections(in tableView: UITableView) -> Int { return 2 }
++    override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { return section == 0 ? 4 : (message.text.isEmpty ? 0 : 2) }
++    override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
++        return section == 1 ? "Tarjimani tanlasangiz, matn tanlangan xizmat saytiga yuboriladi. Brauzerda tilni almashtirish mumkin. Google: o‘zbekcha; DeepL: inglizcha." : nil
++    }
++    override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
++        let cell = UITableViewCell(style: .subtitle, reuseIdentifier: nil)
++        cell.textLabel?.numberOfLines = 0
++        if indexPath.section == 0 {
++            switch indexPath.row {
++            case 0: cell.textLabel?.text = "Chat ID: \(message.id.peerId.toInt64()) · Xabar ID: \(message.id.id)"
++            case 1: cell.textLabel?.text = "Muallif: " + (message.author?.debugDisplayTitle ?? "—")
++            case 2: cell.textLabel?.text = Date(timeIntervalSince1970: Double(message.timestamp)).description
++            default:
++                if let file = message.media.compactMap({ $0 as? TelegramMediaFile }).first {
++                    cell.textLabel?.text = "\(file.fileName ?? "Fayl")\n\(file.mimeType) · \(file.size ?? 0) bayt"
++                } else { cell.textLabel?.text = message.text.isEmpty ? "Media xabar" : message.text }
++            }
++        } else { cell.textLabel?.text = indexPath.row == 0 ? "Google’da tarjima (brauzer)" : "DeepL’da tarjima (brauzer)"; cell.accessoryType = .disclosureIndicator }
++        return cell
++    }
++    override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
++        tableView.deselectRow(at: indexPath, animated: true)
++        guard indexPath.section == 1 else { return }
++        let text = String(message.text.prefix(5000))
++        let url: String
++        if indexPath.row == 0 {
++            var components = URLComponents(string: "https://translate.google.com/")!
++            components.queryItems = [URLQueryItem(name: "sl", value: "auto"), URLQueryItem(name: "tl", value: "uz"), URLQueryItem(name: "text", value: text), URLQueryItem(name: "op", value: "translate")]
++            guard let value = components.url?.absoluteString else { return }
++            url = value
++        } else {
++            guard let escaped = text.addingPercentEncoding(withAllowedCharacters: .alphanumerics) else { return }
++            url = "https://www.deepl.com/en/translator#auto/en/" + escaped
++        }
++        context.sharedContext.applicationBindings.openUrl(url)
++    }
++}
+diff --git a/submodules/TelegramUI/Sources/UgramShareCopy.swift b/submodules/TelegramUI/Sources/UgramShareCopy.swift
+new file mode 100644
+--- /dev/null
++++ b/submodules/TelegramUI/Sources/UgramShareCopy.swift
+@@ -0,0 +1,107 @@
++import Foundation
++import UIKit
++import Postbox
++import TelegramCore
++import SwiftSignalKit
++import AccountContext
++import Display
++import LegacyUI
++import ShareController
++
++func ugramCanShareCopy(_ message: Message) -> Bool {
++    guard UgramPreferences.enabled(.shareCopies), ugramCanKeepMessage(message) else { return false }
++    return message.media.isEmpty || message.media.contains { $0 is TelegramMediaFile || $0 is TelegramMediaImage || $0 is TelegramMediaWebpage }
++}
++
++func ugramPresentCopy(context: AccountContext, message: Message, present: @escaping (ViewController) -> Void) {
++    guard ugramCanShareCopy(message) else { return }
++    let media = message.media.first { $0 is TelegramMediaFile || $0 is TelegramMediaImage }
++    guard let media = media else {
++        present(ShareController(context: context, subject: .text(message.text)))
++        return
++    }
++    let wrapper = LegacyController(presentation: .modal(animateIn: true), theme: context.sharedContext.currentPresentationData.with { $0 }.theme)
++    let controller = UgramCopyPreparation(context: context, message: message, media: media)
++    controller.finished = { [weak wrapper] subject in
++        wrapper?.dismiss(completion: {
++            present(ShareController(context: context, subject: subject, presetText: message.text, externalShare: false))
++        })
++    }
++    controller.cancel = { [weak wrapper] in wrapper?.dismiss() }
++    wrapper.bind(controller: UINavigationController(rootViewController: controller))
++    present(wrapper)
++}
++
++private final class UgramCopyPreparation: UIViewController {
++    private let context: AccountContext
++    private let message: Message
++    private let media: Media
++    private let fetch = MetaDisposable()
++    private let data = MetaDisposable()
++    private let status = UILabel()
++    private var timer: Foundation.Timer?
++    private var ended = false
++    var finished: ((ShareControllerSubject) -> Void)?
++    var cancel: (() -> Void)?
++    init(context: AccountContext, message: Message, media: Media) {
++        self.context = context; self.message = message; self.media = media
++        super.init(nibName: nil, bundle: nil)
++    }
++    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
++    deinit { fetch.dispose(); data.dispose(); timer?.invalidate() }
++    override func viewDidLoad() {
++        super.viewDidLoad()
++        title = "Nusxa sifatida ulashish"
++        view.backgroundColor = .systemBackground
++        status.text = "Media yuklanmoqda…\nTayyor bo‘lgach qabul qiluvchini tanlaysiz."
++        status.numberOfLines = 0; status.textAlignment = .center
++        status.translatesAutoresizingMaskIntoConstraints = false
++        view.addSubview(status)
++        NSLayoutConstraint.activate([status.centerYAnchor.constraint(equalTo: view.centerYAnchor), status.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24), status.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24)])
++        navigationItem.leftBarButtonItem = UIBarButtonItem(systemItem: .cancel, primaryAction: UIAction { [weak self] _ in
++            self?.stop(); self?.cancel?()
++        })
++    }
++    override func viewDidAppear(_ animated: Bool) {
++        super.viewDidAppear(animated)
++        guard !ended, timer == nil else { return }
++        start()
++    }
++    private func stop() { ended = true; fetch.dispose(); data.dispose(); timer?.invalidate() }
++    private func failed() { stop(); status.text = "Faylni yuklab bo‘lmadi. Internetni tekshirib, qayta urinib ko‘ring." }
++    private func start() {
++        let resource: MediaResource
++        let contentType: MediaResourceUserContentType
++        if let file = media as? TelegramMediaFile {
++            resource = file.resource; contentType = MediaResourceUserContentType(file: file)
++        } else if let image = media as? TelegramMediaImage, let representation = image.representations.max(by: { $0.dimensions.width * $0.dimensions.height < $1.dimensions.width * $1.dimensions.height }) {
++            resource = representation.resource; contentType = .image
++        } else { failed(); return }
++        timer = Foundation.Timer.scheduledTimer(withTimeInterval: 300, repeats: false) { [weak self] _ in self?.failed() }
++        let reference = AnyMediaReference.message(message: MessageReference(message), media: media)
++        data.set((context.account.postbox.mediaBox.resourceData(resource)
++            |> filter { $0.complete }
++            |> take(1)
++            |> deliverOnMainQueue).start(next: { [weak self] value in
++                self?.prepared(resource: resource, size: Int64(value.size))
++            }))
++        if !ended {
++            fetch.set((fetchedMediaResource(mediaBox: context.account.postbox.mediaBox, userLocation: .peer(message.id.peerId), userContentType: contentType, reference: .media(media: reference, resource: resource))
++                |> deliverOnMainQueue).start(error: { [weak self] _ in self?.failed() }))
++        }
++    }
++    private func prepared(resource: MediaResource, size: Int64) {
++        guard !ended, size > 0 else { return }
++        stop()
++        let local = LocalFileMediaResource(fileId: Int64.random(in: Int64.min ... Int64.max), size: size)
++        context.account.postbox.mediaBox.copyResourceData(from: resource.id, to: local.id, synchronous: true)
++        guard context.account.postbox.mediaBox.completedResourcePath(local) != nil else { status.text = "Nusxa tayyorlab bo‘lmadi."; return }
++        let copied: Media
++        if let file = media as? TelegramMediaFile {
++            copied = TelegramMediaFile(fileId: MediaId(namespace: Namespaces.Media.LocalFile, id: local.fileId), partialReference: nil, resource: local, previewRepresentations: [], videoThumbnails: [], immediateThumbnailData: file.immediateThumbnailData, mimeType: file.mimeType, size: size, attributes: file.attributes, alternativeRepresentations: [])
++        } else if let image = media as? TelegramMediaImage, let representation = image.representations.max(by: { $0.dimensions.width * $0.dimensions.height < $1.dimensions.width * $1.dimensions.height }) {
++            copied = TelegramMediaImage(imageId: MediaId(namespace: Namespaces.Media.LocalImage, id: local.fileId), representations: [TelegramMediaImageRepresentation(dimensions: representation.dimensions, resource: local, progressiveSizes: [], immediateThumbnailData: nil)], immediateThumbnailData: image.immediateThumbnailData, reference: nil, partialReference: nil, flags: [])
++        } else { status.text = "Bu media turi qo‘llanmaydi."; return }
++        finished?(.media(.standalone(media: copied), nil))
++    }
++}
+diff --git a/ugram-tests/main.swift b/ugram-tests/main.swift
+new file mode 100644
+--- /dev/null
++++ b/ugram-tests/main.swift
+@@ -0,0 +1,77 @@
++import Foundation
++
++var checks = 0
++func check(_ condition: Bool, _ description: String) {
++    precondition(condition, description)
++    checks += 1
++}
++
++let root = FileManager.default.temporaryDirectory.appendingPathComponent("ugram-tests-" + UUID().uuidString)
++try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
++defer {
++    try? FileManager.default.removeItem(at: root)
++    for flag in UgramPreferences.Flag.allCases { UserDefaults.standard.removeObject(forKey: "ugram." + flag.rawValue) }
++    UserDefaults.standard.removeObject(forKey: "ugram.filter")
++}
++
++for flag in UgramPreferences.Flag.allCases {
++    UserDefaults.standard.removeObject(forKey: "ugram." + flag.rawValue)
++    check(!UgramPreferences.enabled(flag), "All feature flags must default off")
++    UgramPreferences.set(flag, true)
++    check(UgramPreferences.enabled(flag), "Feature toggle must persist")
++    UgramPreferences.set(flag, false)
++}
++
++let archive = UgramLocalArchive(accountPath: root.appendingPathComponent("account-a").path)
++let other = UgramLocalArchive(accountPath: root.appendingPathComponent("account-b").path)
++check(try archive.entries().isEmpty, "A new account has no history")
++let original = root.appendingPathComponent("cached-video.mp4")
++let payload = Data((0 ..< 2048).map { UInt8($0 % 251) })
++try payload.write(to: original)
++let entry = UgramArchiveEntry(peerId: 100, messageId: 42, timestamp: 1234, kind: "deleted", chat: "Sinov", author: "O‘zbek", text: "Salom 👋", missingMedia: false)
++try archive.append(entry, files: [(original.path, "../../video.mp4")])
++try FileManager.default.removeItem(at: original)
++let stored = try archive.entries()
++check(stored.count == 1, "Deleted message must persist")
++check(stored[0].text == "Salom 👋", "Unicode text must round-trip")
++check(stored[0].attachments.count == 1, "Downloaded attachment must be retained")
++let url = archive.attachmentURL(stored[0].attachments[0])!
++check(try Data(contentsOf: url) == payload, "Media must survive deletion of Telegram's original cache file")
++check(url.path.hasPrefix(archive.directory.path + "/"), "Untrusted filenames must not escape the archive")
++check(archive.attachmentURL("../../cached-video.mp4") == nil, "Traversal must be rejected")
++check(try other.entries().isEmpty, "Accounts must be isolated")
++check(try archive.entries(peerId: 200).isEmpty, "Chat history must be isolated")
++check(try UgramLocalArchive(accountPath: root.appendingPathComponent("account-a").path).entries().count == 1, "History must survive reopening")
++
++let edit = UgramArchiveEntry(peerId: 100, messageId: 42, timestamp: 1234, kind: "edited", chat: "Sinov", author: "O‘zbek", text: "Old text", missingMedia: false)
++try archive.append(edit, files: [(root.appendingPathComponent("missing").path, "missing.jpg")])
++let edited = try archive.entries().first(where: { $0.kind == "edited" })!
++check(edited.missingMedia, "Missing media must be reported, never represented as a recovered file")
++check(edited.attachments.isEmpty, "Missing media must not produce a bogus attachment")
++check(try archive.entries().count == 2, "Edits and deletions must coexist")
++try archive.remove(edited)
++check(try archive.entries().count == 1, "Removing one entry must preserve the rest")
++try archive.clear()
++check(try archive.entries().isEmpty, "Clear must remove the selected account archive")
++
++let limited = UgramLocalArchive(accountPath: root.appendingPathComponent("limited").path, entryLimit: 2, byteLimit: 6)
++let smallFile = root.appendingPathComponent("small.bin")
++try Data([1, 2, 3, 4]).write(to: smallFile)
++try limited.append(entry, files: [(smallFile.path, "a.bin")])
++try limited.append(edit, files: [(smallFile.path, "b.bin")])
++check(try limited.entries().count == 1, "Byte limit must evict old media")
++check(try limited.entries().first?.kind == "edited", "Retention must keep the newest entry")
++try limited.clear()
++for number in 0 ..< 3 {
++    try limited.append(UgramArchiveEntry(peerId: 100, messageId: Int32(number), timestamp: 1, kind: "deleted", chat: "", author: "", text: "\(number)", missingMedia: false), files: [])
++}
++check(try limited.entries().count == 2, "Entry count limit must be enforced")
++
++UserDefaults.standard.set("spam|reklama", forKey: "ugram.filter")
++check(UgramMessageFilter.matches("Bu reklama xabari"), "Filter must match incoming text")
++check(!UgramMessageFilter.matches("Salom 👋"), "Filter must preserve unrelated Unicode text")
++UserDefaults.standard.set("[", forKey: "ugram.filter")
++check(!UgramMessageFilter.matches("hello"), "Invalid persisted patterns fail open")
++UserDefaults.standard.set("", forKey: "ugram.filter")
++check(!UgramMessageFilter.matches("spam"), "Clearing the pattern disables filtering")
++print("Ugram local storage and filter: \(checks) checks passed")
+diff --git a/ugram-tests/run.sh b/ugram-tests/run.sh
+new file mode 100644
+--- /dev/null
++++ b/ugram-tests/run.sh
+@@ -0,0 +1,14 @@
++#!/usr/bin/env bash
++set -euo pipefail
++UGRAM_SOURCE="${1:?Pass the patched Telegram-iOS checkout}"
++UGRAM_TEST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++UGRAM_TEST_OUT="$(mktemp -d)"
++trap 'rm -rf "$UGRAM_TEST_OUT"' EXIT
++swiftc -warnings-as-errors \
++  "$UGRAM_SOURCE/submodules/TelegramCore/Sources/UgramLocalStore.swift" \
++  "$UGRAM_SOURCE/submodules/TelegramCore/Sources/UgramMessageFilter.swift" \
++  "$UGRAM_TEST_ROOT/main.swift" -o "$UGRAM_TEST_OUT/local-tests"
++"$UGRAM_TEST_OUT/local-tests"
++while IFS= read -r -d '' UGRAM_SWIFT_FILE; do
++  swiftc -frontend -parse "$UGRAM_SWIFT_FILE"
++done < <(find "$UGRAM_SOURCE/submodules/TelegramCore/Sources" "$UGRAM_SOURCE/submodules/TelegramUI/Sources" -name 'Ugram*.swift' -print0)

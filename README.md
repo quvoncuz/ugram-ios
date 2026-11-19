@@ -2,8 +2,41 @@
 
 Build bootstrap for a personal iPhone preview, based on the official
 [Telegram-iOS release 13.2](https://github.com/TelegramMessenger/Telegram-iOS/tree/24638bc69bd083981b178dd1e7f921eebbf7fc46).
-This is an unofficial client. **The Android Ugram features have not been ported.**
-The bootstrap has not yet passed a macOS build or an iPhone installation test.
+This is an unofficial client. The original bootstrap passed cloud build #2.
+The new feature overlay below still requires its own successful cloud build and
+device acceptance checks. This is not complete Android/iOS feature parity.
+
+## Ugram feature preview
+
+Open the **Ugram** tab to enable individual features. All switches default off;
+switches apply to all accounts on this device, while archives are account-local.
+
+| Feature | Implementation and limits |
+| --- | --- |
+| Deleted messages | Snapshots messages already stored locally before live server deletion updates; separate history screen, also accessible from a chat's message menu. |
+| Edit history | Retains the previous locally stored version before an edit update. |
+| Deleted media | Keeps a hard-linked/copied version of fully downloaded media outside Telegram's cache. Missing downloads are explicitly labelled; no server recovery. |
+| Share as copy | Message-menu action downloads one selected image/file and creates a new upload with its media attributes. Supports ordinary and round video, voice, music, documents, GIFs and stickers; native destination permissions remain enforced. Multi-item album reconstruction is not implemented. |
+| Ghost mode | Separate switches for read receipts, story views, typing and online status. Local operation cleanup continues; no fake server pts. Other sessions can still reveal activity. Turning reads back on can reveal earlier reads through subsequent cumulative read watermarks. |
+| Local content rules | Optional relaxation of non-sensitive client restriction rules. Server access, paid content and age checks remain intact. |
+| Regex filter | Hides matching incoming messages locally; bounded pattern/input and matching time. Reopen the chat after changing it. Does not delete messages. |
+| Message details / translation | Message IDs, sender, date and file information. Explicit actions open Google Translate (Uzbek) or DeepL (English) in the browser; the selected text is shared only when the user chooses that action. Native Telegram translation remains available. |
+
+History excludes secret chats, self-destructing/timed/ephemeral, paid and age-gated
+content. It cannot recover content never received or downloaded. Cleanup during
+offline history-gap recovery is not currently archived. History retains at most
+5,000 records and 1 GB of media, evicting the oldest first. It stays in the app's
+account container, is excluded from backup, and can be cleared in Ugram settings.
+Android-only appearance/Monet, UnifiedPush, arbitrary API/DNS settings and local
+Premium UI emulation are not part of this iOS preview.
+
+The complete auditable source diff is `ugram.patch`; `scripts/apply_features.py`
+checks every hunk before applying it. `overlay/`, `tests/` and the patch generator
+are maintained in the local development workspace; the public build repository
+needs only the resulting patch and build scripts. The patch includes host Swift
+tests for durable media retention, Unicode, account/chat isolation, path safety,
+limits, feature toggles and filters, plus a parse check for new Swift files.
+An actual iOS build and device checks are still required for Telegram integration.
 
 ## Free build from Linux
 
@@ -64,8 +97,12 @@ without printing API values. `scripts/build.sh` runs only on macOS.
 for the subsequent local signing step. `scripts/icon.swift` draws a placeholder
 Ugram icon. None of these scripts access an Apple account.
 
-Next milestones: first successful cloud build, successful sideload and login,
-then an explicit implementation and device test of each Ugram-specific feature.
+Device acceptance: install the new build, enable the needed switches, then use
+two test accounts to exercise deletion/edit while the app is online, downloaded
+and missing media, relaunch persistence, copy/upload and cancellation, each ghost
+toggle on/off, account switching, filtering and clearing history. No device test
+is claimed until these are performed. Native UIKit screens also need visual QA
+on an iPhone; the Linux workspace cannot record an iOS simulator.
 
 References: [GitHub runner images](https://github.com/actions/runner-images),
 [Actions billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions),

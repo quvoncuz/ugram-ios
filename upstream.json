@@ -5,5 +5,5 @@
   "xcode": "27.1",
   "bundle_id": "uz.ugram.ios",
   "display_name": "Ugram Preview",
-  "status": "bootstrap; Android Ugram features are not ported yet"
+  "status": "Ugram feature preview; first feature build and device validation pending"
 }
