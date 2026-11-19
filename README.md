@@ -14,6 +14,11 @@ The bootstrap has not yet passed a macOS build or an iPhone installation test.
    Add repository secrets `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`.
    Do not put these values in source files, workflow inputs, issues, or chat.
 4. Open **Actions → iPhone preview → Run workflow**.
+   For personal testing with the published API already used by an Android build,
+   enable **Allow the published Android API for personal testing only**. This is
+   off by default. Telegram's sample API is server-limited and is unsuitable for
+   distributing an app; obtain your own API before distribution. See
+   [Telegram's API guide](https://core.telegram.org/api/obtaining_api_id).
 5. Download the `Ugram-iOS-preview` artifact and extract `Ugram-preview.ipa`.
 
 The workflow uses the standard `xcode-27` GitHub-hosted runner and deliberately
